@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/queue.h>
 #include <sys/wait.h>
 
 #ifdef UPERF_LINUX
@@ -68,6 +69,17 @@
 extern options_t options;
 static uperf_log_t log;
 static int reap_children = 0;
+
+struct master_conn {
+	SLIST_ENTRY(master_conn)	entries;	// singly-linked list
+	char 	host[MAXHOSTNAME];	// remote master
+	int		child_sockfd;		// sockets for parent -> child IPC
+};
+
+SLIST_HEAD(master_conns_head, master_conn);
+static struct master_conns_head master_conns;
+
+static int parent_sockfd;	// socket for parent -> child IPC (used by child)
 
 static void slave_master_goodbye(uperf_shm_t *shm, protocol_t *control);
 
@@ -142,6 +154,88 @@ wait_unlock_barrier(uperf_shm_t *shm, int txn)
 	return (0);
 }
 
+static int get_new_ctrl_socket()
+{
+	int ctrl_fd = -1;
+
+	/* Now get a message with new TCP socket */
+	struct msghdr msgh;
+	struct cmsghdr *cmsg;
+	struct iovec iov[1];
+	char c;
+	union {         /* Ancillary data buffer, wrapped in a union
+					   in order to ensure it is suitably aligned */
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u;
+
+	printf("Polling parent socket for message\n");
+	if (generic_poll(parent_sockfd, -1, POLLIN) < 0) {
+		uperf_error("Error getting rights on the recovered connection during poll\n");
+		return (-1);
+	}
+	printf("Ended polling parent socket for message\n");
+
+	iov[0].iov_base = &c;
+	iov[0].iov_len = 1;
+	msgh.msg_name = NULL;
+	msgh.msg_namelen = 0;
+	msgh.msg_iov = iov;
+	msgh.msg_iovlen = 1;
+	msgh.msg_control = u.buf;
+	msgh.msg_controllen = sizeof(u.buf);
+
+	if (recvmsg(parent_sockfd, &msgh, 0) < 0) {
+		uperf_error("Error %d getting rights on the recovered connection\
+					 during recvmsg: %s\n", errno, strerror(errno));
+		return (-1);
+	}
+
+	/* Receive auxiliary data in msgh */
+	for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg != NULL; cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+			ctrl_fd = * ((int *)CMSG_DATA(cmsg));
+			break;
+		} else {
+			uperf_error("Unexpected message\n");
+		}
+	}
+
+ret:
+	return ctrl_fd;
+}
+
+static int recover_ctrl_conn_child(protocol_t *control)
+{
+	if (generic_poll(parent_sockfd, -1, POLLIN) < 0) {
+		uperf_error("Error polling control connection recovery parent_sockfd\n");
+		return UPERF_FAILURE;
+	}
+
+	protocol_t new_p;
+	int read_ret, new_fd;
+
+	read_ret = ensure_read_fd(parent_sockfd, &new_p, sizeof(protocol_t));
+	if (read_ret == sizeof(protocol_t)) {
+		memcpy(control, &new_p, sizeof(new_p));
+		control->port = new_p.port;
+	} else {
+		uperf_error("Reading control connection recovery fd return %d\n", read_ret);
+		return (-1);
+	}
+
+	new_fd = get_new_ctrl_socket();
+
+	if (new_fd < 0) {
+		uperf_error("Bad new control socket\n");
+		return UPERF_FAILURE;
+	} else {
+		control->fd = new_fd;
+	}
+
+	return UPERF_SUCCESS;
+}
+
 /*
  * State 1:
  * 	if (message from master)
@@ -165,10 +259,16 @@ slave_master_poll(uperf_shm_t *shm, protocol_t *control)
 			return (-1);
 		}
 		if (generic_poll(control->fd, 1000, POLLIN) > 0) {
-			if ((uperf_get_command(control, &uc, shm->bitswap)
-			    != 0)) {
-				uperf_error("Error in get command\n");
-				return (-1);
+			if ((uperf_get_command(control, &uc, shm->bitswap) != 0)) {
+				uperf_warn("Error in get command\n");
+				uperf_info("Trying to recover control connection...\n");
+				if (recover_ctrl_conn_child(control) != UPERF_SUCCESS) {
+					uperf_error("Control connection recovery failed\n");
+					close(parent_sockfd);
+					return (-1);
+				}
+				uperf_info("Continue running with new control connection\n");
+				continue;
 			}
 			if (uc.command == UPERF_CMD_NEXT_TXN) {
 				/* Unlock this barrier */
@@ -402,6 +502,88 @@ setup_slave_signal()
 	return (UPERF_SUCCESS);
 }
 
+/**
+ * Grant TCP socket permissions
+ *
+ * During control connection recovery after the new connection is received
+ * by the slave parent process, this connection is passed to the corresponding
+ * child process. After passing a new connection to child permissions to handle
+ * it must be granted.
+ */
+static int grant_socket_perms(int child_sockfd, int sock)
+{
+	struct msghdr msgh = { 0 };
+	struct iovec iov[1];
+	struct cmsghdr *cmsg;
+	char c;
+	int *fdptr;
+	union {         /* Ancillary data buffer, wrapped in a union
+					   in order to ensure it is suitably aligned */
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u;
+
+	msgh.msg_control = u.buf;
+	msgh.msg_controllen = sizeof(u.buf);
+	cmsg = CMSG_FIRSTHDR(&msgh);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+	fdptr = (int *) CMSG_DATA(cmsg);    /* Initialize the payload */
+	*fdptr = sock;
+
+	msgh.msg_name = NULL;
+	msgh.msg_namelen = 0;
+
+	// we have to send at least one byte, otherwise client read() will return 0
+	// and it will be impossible to distinguish closed socket from 0 msg len
+	iov[0].iov_base = &c;
+	iov[0].iov_len = 1;
+	msgh.msg_iov = iov;
+	msgh.msg_iovlen = 1;
+
+	return sendmsg(child_sockfd, &msgh, 0);
+}
+
+static void recover_ctrl_conn_parent(struct master_conn *mc, protocol_t *conn)
+{
+	if (ensure_write_fd(mc->child_sockfd, conn, sizeof(protocol_t)) < 0) {
+		goto err;
+	}
+
+	if (grant_socket_perms(mc->child_sockfd, conn->fd) > 0) {
+		uperf_info("Sent new control connection to child\n");
+		destroy_protocol(conn->type, conn);
+	} else {
+		goto err;
+	}
+
+	return;
+
+err:
+	uperf_error("Could not recover control connection");
+	destroy_protocol(conn->type, conn);
+	close(mc->child_sockfd);
+}
+
+static struct master_conn * find_master_connection(const char *host)
+{
+	struct master_conn *mc;
+
+	SLIST_FOREACH(mc, &master_conns, entries) {
+		if (strncmp(host, mc->host, sizeof(mc->host)) == 0) {
+			return mc;
+		}
+	}
+
+	return NULL;
+}
+
+static void reg_master_conn(struct master_conn *mc, protocol_t *control)
+{
+	SLIST_INSERT_HEAD(&master_conns, mc, entries);
+	memcpy(mc->host, control->host, sizeof(mc->host));
+}
 
 /*
  * Function: init_slave Description: 1. Initializes the slave 2. waits on
@@ -415,6 +597,7 @@ slave()
 	protocol_t	*slave_conn;
 
 	uperf_log_init(&log);
+	SLIST_INIT(&master_conns);
 
 	if (protocol_init(NULL) == UPERF_FAILURE) {
 		return (-1);
@@ -438,7 +621,9 @@ slave()
 	 * execute the request
 	 */
 	for (;;) {
-		int status;
+		int status, sockfd[2];
+		struct master_conn *mc = NULL;
+
 		conn = slave_conn->accept(slave_conn, NULL);
 		if (conn == NULL) { /* timeout or poll is interrupted */
 			uperf_log_flush();
@@ -451,13 +636,69 @@ slave()
 			}
 			continue;
 		}
+
+		// waiting for UPERF_CMD_HANDLE_CTRL_CONN to identify if it's a new
+		// connection or recovery of the existing one
+		int poll_ret = generic_poll(conn->fd, CTRL_HANDLE_TIMEOUT_MS, POLLIN);
+		if (poll_ret > 0) {
+			uperf_command_t uc;
+			// TODO: handle bitswap
+			if ((uperf_get_command(conn, &uc, 0) != 0)) {
+				uperf_warn("Could not get command\n");
+				continue;
+			}
+			if (uc.command != UPERF_CMD_HANDLE_CTRL_CONN) {
+				uperf_warn("Unexpected command");
+				continue;
+			}
+
+			mc = find_master_connection(conn->host);
+
+			if (uc.value == CTRL_HANDLE_RECOVERY) {
+				if (mc == NULL) {
+					uperf_warn("Recovery request from unknown master\n");
+					destroy_protocol(conn->type, conn);
+					continue;
+				}
+				recover_ctrl_conn_parent(mc, conn);
+				continue;
+			} else if (uc.value == CTRL_HANDLE_NEW) {
+				if (mc != NULL) {
+					uperf_warn("New connection request for existing master\n");
+					close(mc->child_sockfd);
+				} else {
+					uperf_warn("Registering a new master\n");
+					mc = malloc(sizeof(struct master_conn));
+					reg_master_conn(mc, conn);
+				}
+			} else {
+				uperf_warn("Unexpected CMD_HANDLE_CTRL_CONN value: %d\n", uc.value);
+				destroy_protocol(conn->type, conn);
+				continue;
+			}
+		} else if (poll_ret < 0) {
+			uperf_warn("Error during polling for the first command\n");
+			destroy_protocol(conn->type, conn);
+			continue;
+		}
+
+		if (socketpair(AF_LOCAL, SOCK_STREAM, 0, sockfd) == -1) {
+			uperf_warn("Error during creating a socket pair\n");
+			destroy_protocol(conn->type, conn);
+			continue;
+		}
+
 		status = fork();
 		if (status == 0) {
 			/* child */
+			parent_sockfd = sockfd[0];
+			close(sockfd[1]);
 			(void) slave_master(conn);
 			exit(0);
 		} else  {
 			/* parent */
+			mc->child_sockfd = sockfd[1];
+			close(sockfd[0]);
 			uperf_info("forked one\n");
 			destroy_protocol(conn->type, conn);
 		}

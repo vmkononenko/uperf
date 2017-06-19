@@ -176,8 +176,8 @@ group_assign_stat(uperf_shm_t *shm, group_t *g, uint32_t sid)
 static int
 poll_slaves()
 {
+	int ret = 0;
 	int i;
-	int error;
 	struct pollfd pfd[MAXSLAVES];
 	int no_pfds = no_slaves;
 	uint64_t timeout;
@@ -188,12 +188,45 @@ poll_slaves()
 		pfd[i].events = POLLIN;
 		pfd[i].revents = 0;
 	}
-	error = poll(pfd, no_pfds, timeout);
-	if (error < 0) {
-		perror("poll:");
+	ret = poll(pfd, no_pfds, timeout);
+
+	if (ret < 0) {
+		perror("Error during polling slaves:");
+		return ret;
 	}
 
-	return (error);
+	if (ret == 0) {
+		return ret;
+	}
+
+	/* If closed control connections are detected try to recover them */
+	int processed_cnt = 0, read_ret;
+	char buf[1];
+
+	for (i = 0; i < no_slaves && processed_cnt < ret; i++) {
+		if (pfd[i].revents == 0) {
+			continue;
+		}
+
+		read_ret = slaves[i]->read(slaves[i], buf, sizeof (buf), NULL);
+		if (read_ret != 0) {
+			// Recover control connection only in the case of a closed
+			// socket. Other error cases (e.g. command received from a
+			// slave) are not handled
+			return (-1);
+		}
+		uperf_info("Closed socket detected. Trying to reconnect\n");
+		if ((slaves[i]->connect(slaves[i], NULL) == 0) &&
+			(uperf_send_command(slaves[i], UPERF_CMD_HANDLE_CTRL_CONN, CTRL_HANDLE_RECOVERY) > 0))
+		{
+			processed_cnt++;
+		} else {
+			uperf_error("Could not recover control connection with slave\n");
+			return (-1);
+		}
+	}
+
+	return poll_slaves();
 }
 
 /* Send a command to all slaves */
@@ -353,7 +386,7 @@ new_control_connection(group_t *g, char *host)
 	p = g->control;
 	while (p) {
 		if (strncasecmp(host, p->host, MAXHOSTNAME) == 0) {
-			uperf_info("Resuing control connection for %s\n", host);
+			uperf_info("Resuming control connection for %s\n", host);
 			return (UPERF_SUCCESS);
 		}
 		p = p->next;
@@ -362,7 +395,9 @@ new_control_connection(group_t *g, char *host)
 	p = create_protocol(PROTOCOL_TCP, host, MASTER_PORT, MASTER);
 	if (p != NULL) {
 		/* Try connecting */
-		if (p->connect(p, NULL) == 0) {
+		if ((p->connect(p, NULL) == 0) &&
+			(uperf_send_command(p, UPERF_CMD_HANDLE_CTRL_CONN, CTRL_HANDLE_NEW) > 0))
+		{
 			p->next = g->control;
 			if (g->control)
 				g->control->prev = p;

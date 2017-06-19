@@ -157,7 +157,8 @@ preprocess_accepts(uperf_shm_t *shm, group_t *g, slave_info_t **sl,
 static char cmds[][64] = { "UPERF_CMD_NEXT_TXN",
 	"UPERF_CMD_ABORT",
 	"UPERF_CMD_SEND_STATS",
-	"UPERF_CMD_ERROR"};
+	"UPERF_CMD_ERROR",
+	"UPERF_CMD_HANDLE_CTRL_CONN" };
 int
 uperf_get_command(protocol_t *p, uperf_command_t *uc, int bitswap)
 {
@@ -179,7 +180,7 @@ uperf_get_command(protocol_t *p, uperf_command_t *uc, int bitswap)
 		uc->command = BSWAP_32(uc->command);
 		uc->value = BSWAP_32(uc->value);
 	}
-	uperf_info("RX Command [%s, %d] from %s\n", cmds[uc->command],
+	uperf_info("RX Command %d [%s, %d] from %s\n", uc->command, cmds[uc->command],
 	    uc->value, p->host);
 	return (0);
 }
@@ -199,14 +200,13 @@ uperf_send_command(protocol_t *p, uperf_cmd command, uint32_t val)
 	return (p->write(p, &uc, sizeof (uperf_command_t), NULL));
 }
 
-int
-ensure_read(protocol_t *p, void *buffer, int size)
+int ensure_read_fd(int fd, void *buffer, int size)
 {
 	int n, sz;
 
 	sz = 0;
 	while (sz < size) {
-		if ((n = read(p->fd, buffer + sz, size - sz)) <= 0) {
+		if ((n = read(fd, buffer + sz, size - sz)) <= 0) {
 			return (n);
 		}
 		sz += n;
@@ -215,16 +215,28 @@ ensure_read(protocol_t *p, void *buffer, int size)
 }
 
 int
-ensure_write(protocol_t *p, void *buffer, int size)
+ensure_write_fd(int fd, void *buffer, int size)
 {
 	int n, sz;
 
 	sz = 0;
 	while (sz < size) {
-		if ((n = write(p->fd, buffer + sz, size - sz)) <= 0) {
+		if ((n = write(fd, buffer + sz, size - sz)) <= 0) {
 			return (n);
 		}
 		sz += n;
 	}
 	return (sz);
+}
+
+int
+ensure_read(protocol_t *p, void *buffer, int size)
+{
+	return ensure_read_fd(p->fd, buffer, size);
+}
+
+int
+ensure_write(protocol_t *p, void *buffer, int size)
+{
+	return ensure_write_fd(p->fd, buffer, size);
 }

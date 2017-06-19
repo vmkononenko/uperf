@@ -52,6 +52,10 @@
 
 #define	REPEATED_SIGNAL_RETRIES	5
 
+#define CTRL_HANDLE_TIMEOUT_MS	10000
+#define CTRL_HANDLE_NEW			0
+#define CTRL_HANDLE_RECOVERY	1
+
 typedef enum {
 	MASTER = 0,
 	SLAVE

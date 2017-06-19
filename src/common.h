@@ -25,7 +25,8 @@ typedef enum {
 	UPERF_CMD_NEXT_TXN,
 	UPERF_CMD_ABORT,
 	UPERF_CMD_SEND_STATS,
-	UPERF_CMD_ERROR
+	UPERF_CMD_ERROR,
+	UPERF_CMD_HANDLE_CTRL_CONN
 } uperf_cmd;
 
 typedef struct {
@@ -38,6 +39,8 @@ int preprocess_accepts(uperf_shm_t *, group_t *, slave_info_t **, int );
 int update_strand_with_slave_info(uperf_shm_t *, slave_info_t *, char *, int, int);
 int uperf_get_command(protocol_t *, uperf_command_t*, int);
 int uperf_send_command(protocol_t *p, uperf_cmd command, uint32_t val);
+int ensure_write_fd(int fd, void *buffer, int size);
+int ensure_read_fd(int fd, void *buffer, int size);
 int ensure_write(protocol_t *p, void *buffer, int size);
 int ensure_read(protocol_t *p, void *buffer, int size);
 
